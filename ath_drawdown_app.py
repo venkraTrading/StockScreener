@@ -1,283 +1,279 @@
-# ath_drawdown_app.py
-# Shows stocks X% below their all-time high, with Market Cap filters
-# and "Since ATH (days)" so you can limit to recent ATHs.
-
 import os
 import time
 import math
+from datetime import datetime, timedelta, timezone
+
 import requests
+import yfinance as yf
 import pandas as pd
-import numpy as np
 import streamlit as st
-from datetime import datetime, timezone
-from typing import List
 
-# ---------- Config / helpers ----------
+# ---------- Config ----------
+APP_TITLE = "📈 ATH Drawdown Screener"
+POLY_KEY = os.getenv("POLYGON_API_KEY") or st.secrets.get("POLYGON_API_KEY", "")
 
-def get_api_key() -> str:
-    return st.secrets.get("POLYGON_API_KEY") or os.getenv("POLYGON_API_KEY")
+# ---------- Helpers ----------
 
-API_KEY = get_api_key()
-
-POLY_TICKERS_URL = "https://api.polygon.io/v3/reference/tickers"
-
-def fmt_cap(x: float) -> str:
+def human_billions(x):
     if pd.isna(x):
-        return ""
-    if x >= 1e12:
-        return f"{x/1e12:.2f}T"
-    if x >= 1e9:
-        return f"{x/1e9:.2f}B"
-    if x >= 1e6:
-        return f"{x/1e6:.2f}M"
-    return f"{x:,.0f}"
+        return None
+    return round(float(x) / 1e9, 2)
 
-def fmt_price(x: float) -> str:
-    return "" if pd.isna(x) else f"{x:,.2f}"
+def nice_error_from_response(resp: requests.Response) -> str:
+    try:
+        data = resp.json()
+        # Polygon typically returns: {"status":"ERROR","error": "...", "message": "..."}
+        return data.get("error") or data.get("message") or resp.text
+    except Exception:
+        return resp.text
 
-@st.cache_data(show_spinner=False, ttl=60*60*12)  # cache 12h
-def fetch_polygon_universe(include_otc: bool, pages: int = 3) -> pd.DataFrame:
+@st.cache_data(show_spinner=False, ttl=300)
+def fetch_polygon_universe(include_otc: bool, pages: int = 2):
     """
-    Pull active US stock tickers (type=CS) and market cap from Polygon across a few pages.
-    Returns DataFrame with columns: ticker, name, primary_exchange, market_cap
+    Fetch a list of active US stock tickers from Polygon.
+    We use v3/reference/tickers with cursor pagination.
+    We do NOT use 'sort=market_cap' to avoid API errors on some accounts.
+    Returns a DataFrame with columns: ticker, name, market_cap, primary_exchange, locale
     """
-    if not API_KEY:
-        raise RuntimeError("Missing POLYGON_API_KEY. Set in Secrets or env var.")
+    if not POLY_KEY:
+        raise RuntimeError("Missing POLYGON_API_KEY. Set env var or Streamlit secret.")
 
-    out = []
+    url = "https://api.polygon.io/v3/reference/tickers"
     params = {
         "market": "stocks",
         "active": "true",
-        "type": "CS",
-        "limit": 1000,
-        "sort": "market_cap",
-        "order": "desc",
-        "apiKey": API_KEY,
+        "limit": 1000,           # max allowed by Polygon
+        "order": "desc",         # we'll sort in pandas later if we want
     }
-    next_cursor = None
-    for i in range(pages):
-        if next_cursor:
-            params["cursor"] = next_cursor
-        r = requests.get(POLY_TICKERS_URL, params=params, timeout=30)
-        r.raise_for_status()
-        data = r.json()
+
+    out = []
+    cursor = None
+    fetched_pages = 0
+
+    while fetched_pages < pages:
+        q = params.copy()
+        if cursor:
+            q["cursor"] = cursor
+        q["apiKey"] = POLY_KEY
+
+        resp = requests.get(url, params=q, timeout=30)
+        if not resp.ok:
+            # Surface a friendly API message
+            raise requests.HTTPError(nice_error_from_response(resp), response=resp)
+
+        data = resp.json()
         results = data.get("results", []) or []
-        for row in results:
+        for r in results:
+            # common fields in v3/reference/tickers
             out.append({
-                "ticker": row.get("ticker"),
-                "name": row.get("name"),
-                "primary_exchange": row.get("primary_exchange"),
-                "market_cap": row.get("market_cap"),
+                "ticker": r.get("ticker"),
+                "name": r.get("name"),
+                "market_cap": r.get("market_cap"),
+                "primary_exchange": r.get("primary_exchange"),
+                "locale": r.get("locale"),
             })
-        # polygon sometimes returns "next_url"/"next"/"next_cursor"
-        next_cursor = data.get("next_url") or data.get("next") or data.get("next_cursor")
-        if not next_cursor:
+
+        cursor = data.get("next_url") or data.get("next_url")  # prefer next_url
+        if not cursor:
             break
-        time.sleep(0.3)
 
-    df = pd.DataFrame(out).drop_duplicates(subset=["ticker"]).reset_index(drop=True)
-    if not include_otc:
+        fetched_pages += 1
+        # Be gentle with Polygon
+        time.sleep(0.15)
+
+    df = pd.DataFrame(out)
+    # drop non-US if present
+    if not df.empty and "locale" in df.columns:
+        df = df[df["locale"].fillna("").str.upper().eq("US")]
+
+    if not include_otc and "primary_exchange" in df.columns:
+        # Filter out anything that looks OTC
         df = df[~df["primary_exchange"].fillna("").str.upper().str.contains("OTC")]
-    return df
 
-# ---------- ATH metrics (Yahoo Finance) ----------
+    # Some rows may not have market_cap; standardize type
+    if "market_cap" in df.columns:
+        df["market_cap"] = pd.to_numeric(df["market_cap"], errors="coerce")
 
-import yfinance as yf
+    return df.reset_index(drop=True)
 
-@st.cache_data(show_spinner=False, ttl=60*60*6)  # cache 6h
-def get_ath_metrics(symbols: List[str]) -> pd.DataFrame:
+@st.cache_data(show_spinner=False, ttl=3600)
+def fetch_history_yf(ticker: str, lookback_years: int = 15):
     """
-    Download max history for symbols (batched) and compute:
+    Grab long history from yfinance (15y by default).
+    """
+    try:
+        end = datetime.now(timezone.utc)
+        start = end - timedelta(days=int(365.25 * lookback_years))
+        y = yf.Ticker(ticker)
+        # yfinance needs naive timestamps; it will handle tz internally
+        hist = y.history(start=start.date().isoformat(), end=end.date().isoformat(), auto_adjust=True)
+        if hist is None or hist.empty:
+            return pd.DataFrame()
+        hist = hist.rename(columns=str.lower).reset_index()
+        hist["date"] = pd.to_datetime(hist["date"]).dt.tz_localize(None)
+        return hist
+    except Exception:
+        return pd.DataFrame()
+
+def compute_ath_metrics(hist: pd.DataFrame):
+    """
+    From daily adjusted history, compute:
       - last close
-      - ATH close
-      - drawdown % from ATH
-      - ATH date
-      - Since ATH (days)
-    Returns DataFrame index=ticker with columns:
-      [last, ath, dd_pct, ath_date, since_ath_days]
+      - ATH and date
+      - drawdown %
+      - days since ATH
+    Returns dict or None
     """
-    if not symbols:
-        return pd.DataFrame(columns=["last", "ath", "dd_pct", "ath_date", "since_ath_days"])
+    if hist is None or hist.empty or "close" not in hist.columns:
+        return None
 
-    rows = []
-    batch_size = 40
-    for i in range(0, len(symbols), batch_size):
-        chunk = symbols[i:i+batch_size]
-        try:
-            df = yf.download(
-                tickers=chunk,
-                period="max",
-                interval="1d",
-                auto_adjust=False,
-                progress=False,
-                group_by="ticker",
-                threads=True,
-            )
-        except Exception:
-            continue
+    # Ensure numeric
+    close = pd.to_numeric(hist["close"], errors="coerce")
+    hist = hist.assign(close=close).dropna(subset=["close"])
+    if hist.empty:
+        return None
 
-        # Single symbol shape vs multi-index columns
-        if len(chunk) == 1:
-            sym = chunk[0]
-            sub = df.copy()
-            if "Close" not in sub.columns:
-                continue
-            close = sub["Close"].dropna()
-            if close.empty:
-                continue
-            last = float(close.iloc[-1])
-            ath = float(close.max())
-            ath_idx = close.idxmax()
-            # days since ATH uses last available close date (also handles weekends/holidays)
-            last_idx = close.index[-1]
-            since_days = int((pd.Timestamp(last_idx).tz_localize(None) -
-                              pd.Timestamp(ath_idx).tz_localize(None)).days)
-            dd_pct = (ath - last) / ath * 100.0 if ath > 0 else np.nan
-            rows.append((sym, last, ath, dd_pct, pd.to_datetime(ath_idx).date(), since_days))
-        else:
-            for sym in chunk:
-                try:
-                    sub = df[sym].copy()
-                    close = sub["Close"].dropna()
-                    if close.empty:
-                        continue
-                    last = float(close.iloc[-1])
-                    ath = float(close.max())
-                    ath_idx = close.idxmax()
-                    last_idx = close.index[-1]
-                    since_days = int((pd.Timestamp(last_idx).tz_localize(None) -
-                                      pd.Timestamp(ath_idx).tz_localize(None)).days)
-                    dd_pct = (ath - last) / ath * 100.0 if ath > 0 else np.nan
-                    rows.append((sym, last, ath, dd_pct, pd.to_datetime(ath_idx).date(), since_days))
-                except Exception:
-                    continue
+    last_close = float(hist["close"].iloc[-1])
+    ath_val = float(hist["close"].max())
+    # first date the ATH occurred
+    ath_idx = hist["close"].idxmax()
+    ath_date = hist.loc[ath_idx, "date"]
+    if pd.isna(ath_val) or ath_val <= 0:
+        return None
 
-    out = pd.DataFrame(
-        rows,
-        columns=["ticker", "last", "ath", "dd_pct", "ath_date", "since_ath_days"]
-    ).set_index("ticker")
-    return out
+    dd_pct = (ath_val - last_close) / ath_val * 100.0
+    days_since_ath = (hist["date"].iloc[-1] - ath_date).days
+    return {
+        "last_close": last_close,
+        "ath": ath_val,
+        "ath_date": ath_date.date().isoformat() if not pd.isna(ath_date) else None,
+        "drawdown_pct": dd_pct,
+        "days_since_ath": int(days_since_ath) if pd.notna(days_since_ath) else None,
+    }
 
 # ---------- UI ----------
 
-st.set_page_config(page_title="ATH Drawdown Screener", page_icon="📉", layout="wide")
-st.title("📉 ATH Drawdown Screener")
+st.set_page_config(page_title=APP_TITLE, layout="wide")
+st.title(APP_TITLE)
 st.caption("Universe & Market Caps from Polygon • ATH math from Yahoo Finance history")
 
+# Sidebar filters
 with st.sidebar:
-    st.subheader("Filters")
-
+    st.header("Filters")
     include_otc = st.toggle("Include OTC", value=False)
 
-    # Market cap range (USD, billions for UX)
-    st.caption("Market Cap (USD)")
-    min_cap_b = st.number_input("Min (Billions)", min_value=0.0, value=0.0, step=0.5, format="%.2f")
-    max_cap_b = st.number_input("Max (Billions, 0 = no max)", min_value=0.0, value=0.0, step=0.5, format="%.2f")
+    st.subheader("Market Cap (USD)")
+    min_mc_bil = st.number_input("Min (Billions)", min_value=0.0, value=0.0, step=0.5)
+    max_mc_bil = st.number_input("Max (Billions, 0 = no max)", min_value=0.0, value=0.0, step=0.5)
 
-    # Drawdown threshold
-    dd_min = st.slider("≥ % below ATH", min_value=0, max_value=95, value=50, step=5)
+    st.subheader("≥ % below ATH")
+    min_pct_below = st.slider("", min_value=0, max_value=95, value=50, step=1)
 
-    # NEW: since ATH days filter
-    max_since_days = st.number_input(
-        "Max days since ATH (0 = no limit)",
-        min_value=0, value=1825, step=30, help="Limit to names whose ATH occurred within N days."
-    )
+    st.subheader("Max days since ATH (0 = no limit)")
+    max_days_since_ath = st.number_input("", min_value=0, value=1825, step=5, help="Limit recency of ATH (e.g., 365 = within 1 year).")
 
-    # limit/scaling
-    max_symbols = st.slider("Max symbols to scan", 50, 2500, 600, step=50)
-    pages = st.slider("Polygon pages to fetch", 1, 10, 3)
+    st.subheader("Max symbols to scan")
+    max_symbols = st.slider("", min_value=50, max_value=2000, value=600, step=50)
+
+    st.subheader("Polygon pages to fetch")
+    pages_to_fetch = st.slider("", min_value=1, max_value=10, value=3, step=1,
+                               help="Each page ~1000 tickers (subject to your plan). Fewer pages reduces API usage.")
 
     run_btn = st.button("Run Screener", type="primary")
 
-if not API_KEY:
+# Guard: key must be present
+if not POLY_KEY:
     st.error("Missing POLYGON_API_KEY. Set env var or Streamlit secret.")
     st.stop()
 
-# ---------- Run ----------
-
 if run_btn:
-    with st.spinner("Fetching universe & market caps from Polygon…"):
-        uni = fetch_polygon_universe(include_otc=include_otc, pages=pages)
-        if uni.empty:
-            st.warning("No tickers from Polygon (check filters).")
+    with st.spinner("Fetching universe from Polygon…"):
+        try:
+            uni = fetch_polygon_universe(include_otc=include_otc, pages=pages_to_fetch)
+        except requests.HTTPError as e:
+            msg = str(e)
+            st.error(f"Polygon API error: {msg}")
+            st.info("Tips: lower 'pages to fetch', disable OTC, or wait a minute to cool down rate limits.")
+            st.stop()
+        except Exception as e:
+            st.error(f"Failed to fetch from Polygon: {e}")
             st.stop()
 
-        # Apply market cap range early
-        min_cap = min_cap_b * 1e9
-        max_cap = max_cap_b * 1e9 if max_cap_b > 0 else None
-        if min_cap > 0:
-            uni = uni[uni["market_cap"].fillna(0) >= min_cap]
-        if max_cap:
-            uni = uni[uni["market_cap"].fillna(0) <= max_cap]
-
-        # Top N by cap to control workload
-        uni = uni.sort_values("market_cap", ascending=False).head(max_symbols).reset_index(drop=True)
-        tickers = uni["ticker"].tolist()
-
-    if not tickers:
-        st.warning("No tickers after applying market cap / OTC filters.")
+    if uni.empty:
+        st.warning("Polygon returned an empty universe. Try adjusting pages/OTC.")
         st.stop()
 
-    with st.spinner(f"Computing ATH metrics for {len(tickers)} symbols…"):
-        ath_df = get_ath_metrics(tickers)
+    # Basic market cap filter (billions -> absolute)
+    if "market_cap" in uni.columns:
+        uni["market_cap_bil"] = uni["market_cap"].apply(human_billions)
+        if min_mc_bil > 0:
+            uni = uni[uni["market_cap_bil"].fillna(0) >= min_mc_bil]
+        if max_mc_bil > 0:
+            uni = uni[uni["market_cap_bil"].fillna(0) <= max_mc_bil]
 
-    if ath_df.empty:
-        st.warning("No price history available for selected symbols.")
+    if uni.empty:
+        st.warning("No symbols after market-cap filter.")
         st.stop()
 
-    merged = (
-        ath_df.reset_index()
-              .merge(uni[["ticker", "name", "market_cap"]], on="ticker", how="left")
-    )
+    # Cap how many we scan with yfinance
+    uni = uni.head(int(max_symbols))
 
-    # Filter by drawdown threshold
-    merged = merged[merged["dd_pct"] >= dd_min]
+    st.write(f"Scanning **{len(uni)}** symbols… (yfinance)")
 
-    # NEW: filter by since ATH days if user set a limit
-    if max_since_days > 0:
-        merged = merged[merged["since_ath_days"] <= int(max_since_days)]
+    rows = []
+    progress = st.progress(0)
+    for i, row in uni.reset_index(drop=True).iterrows():
+        t = row["ticker"]
+        # yfinance uses Yahoo tickers; most Polygon US tickers match directly
+        hist = fetch_history_yf(t)
+        if not hist.empty:
+            m = compute_ath_metrics(hist)
+            if m:
+                pct_below = round(m["drawdown_pct"], 2)
+                days_ = m["days_since_ath"] if m["days_since_ath"] is not None else 10**9
+                if pct_below >= min_pct_below and (max_days_since_ath == 0 or days_ <= max_days_since_ath):
+                    rows.append({
+                        "Ticker": t,
+                        "Name": row.get("name"),
+                        "Market Cap (B)": row.get("market_cap_bil"),
+                        "Last Close": round(m["last_close"], 2),
+                        "ATH": round(m["ath"], 2),
+                        "% Below ATH": pct_below,
+                        "ATH Date": m["ath_date"],
+                        "Days Since ATH": m["days_since_ath"],
+                        "Finviz": f"https://finviz.com/quote.ashx?t={t}",
+                    })
+        if (i + 1) % 10 == 0 or i == len(uni) - 1:
+            progress.progress((i + 1) / len(uni))
 
-    # Sort by biggest drawdown (farthest below ATH)
-    merged = merged.sort_values("dd_pct", ascending=False)
+    progress.empty()
 
-    if merged.empty:
-        st.info("No matches for the chosen filters (drawdown/market-cap/since-ATH).")
+    if not rows:
+        st.warning("No symbols matched your filters.")
         st.stop()
 
-    # Present
-    show = merged.copy()
-    show.rename(columns={
-        "ticker": "Symbol",
-        "name": "Company",
-        "last": "Last",
-        "ath": "ATH",
-        "dd_pct": "Below ATH (%)",
-        "market_cap": "Market Cap",
-        "ath_date": "ATH Date",
-        "since_ath_days": "Since ATH (days)",
-    }, inplace=True)
+    df = pd.DataFrame(rows)
+    df = df.sort_values("% Below ATH", ascending=False, na_position="last")
 
-    show["Last"] = show["Last"].map(fmt_price)
-    show["ATH"] = show["ATH"].map(fmt_price)
-    show["Market Cap"] = show["Market Cap"].map(fmt_cap)
-    show["Below ATH (%)"] = show["Below ATH (%)"].map(lambda x: f"{x:,.1f}")
-    # ATH Date already date; ensure string for display
-    show["ATH Date"] = pd.to_datetime(show["ATH Date"]).dt.strftime("%Y-%m-%d")
+    # Turn Finviz into links
+    def linkify(val, label):
+        if pd.isna(val):
+            return ""
+        return f'<a href="{val}" target="_blank">{label}</a>'
 
-    st.subheader(f"Results — {len(show):,} matches")
-    st.dataframe(
-        show[["Symbol", "Company", "Market Cap", "Last", "ATH", "Below ATH (%)", "ATH Date", "Since ATH (days)"]],
-        use_container_width=True,
-        height=600
+    df_display = df.copy()
+    df_display["Ticker"] = df_display.apply(
+        lambda r: f'<a href="https://finviz.com/quote.ashx?t={r["Ticker"]}" target="_blank">{r["Ticker"]}</a>', axis=1
     )
+    df_display["Finviz"] = df_display["Finviz"].apply(lambda u: linkify(u, "Finviz"))
 
-    # CSV
-    csv = merged.to_csv(index=False)
-    st.download_button(
-        "Download CSV",
-        csv,
-        file_name=f"ath_drawdown_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%MUTC')}.csv",
-        mime="text/csv"
-    )
+    # Order columns
+    cols = ["Ticker", "Name", "Market Cap (B)", "Last Close", "ATH", "% Below ATH",
+            "ATH Date", "Days Since ATH", "Finviz"]
+    df_display = df_display[cols]
+
+    st.subheader(f"Results — {len(df_display)} matches")
+    st.caption("Click a ticker or the Finviz link to open details in a new tab.")
+    st.write(df_display.to_html(escape=False, index=False), unsafe_allow_html=True)
 else:
-    st.info("Set your filters (drawdown, market cap, **Max days since ATH**) and click **Run Screener**.")
+    st.info("Set your filters, then press **Run Screener**.")
