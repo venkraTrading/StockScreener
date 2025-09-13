@@ -1,251 +1,283 @@
-# streamlit run ath_drawdown_app.py
+# ath_drawdown_app.py
+# Shows stocks X% below their all-time high, with Market Cap filters
+# and "Since ATH (days)" so you can limit to recent ATHs.
+
 import os
 import time
 import math
-import pytz
-import numpy as np
-import pandas as pd
-import datetime as dt
 import requests
+import pandas as pd
+import numpy as np
 import streamlit as st
-from typing import List, Dict
+from datetime import datetime, timezone
+from typing import List
 
-ET = pytz.timezone("America/New_York")
-BASE = "https://api.polygon.io"
+# ---------- Config / helpers ----------
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Config & helpers
-# ─────────────────────────────────────────────────────────────────────────────
-API_KEY = os.getenv("POLYGON_API_KEY") or st.secrets.get("POLYGON_API_KEY", "")
+def get_api_key() -> str:
+    return st.secrets.get("POLYGON_API_KEY") or os.getenv("POLYGON_API_KEY")
+
+API_KEY = get_api_key()
+
+POLY_TICKERS_URL = "https://api.polygon.io/v3/reference/tickers"
+
+def fmt_cap(x: float) -> str:
+    if pd.isna(x):
+        return ""
+    if x >= 1e12:
+        return f"{x/1e12:.2f}T"
+    if x >= 1e9:
+        return f"{x/1e9:.2f}B"
+    if x >= 1e6:
+        return f"{x/1e6:.2f}M"
+    return f"{x:,.0f}"
+
+def fmt_price(x: float) -> str:
+    return "" if pd.isna(x) else f"{x:,.2f}"
+
+@st.cache_data(show_spinner=False, ttl=60*60*12)  # cache 12h
+def fetch_polygon_universe(include_otc: bool, pages: int = 3) -> pd.DataFrame:
+    """
+    Pull active US stock tickers (type=CS) and market cap from Polygon across a few pages.
+    Returns DataFrame with columns: ticker, name, primary_exchange, market_cap
+    """
+    if not API_KEY:
+        raise RuntimeError("Missing POLYGON_API_KEY. Set in Secrets or env var.")
+
+    out = []
+    params = {
+        "market": "stocks",
+        "active": "true",
+        "type": "CS",
+        "limit": 1000,
+        "sort": "market_cap",
+        "order": "desc",
+        "apiKey": API_KEY,
+    }
+    next_cursor = None
+    for i in range(pages):
+        if next_cursor:
+            params["cursor"] = next_cursor
+        r = requests.get(POLY_TICKERS_URL, params=params, timeout=30)
+        r.raise_for_status()
+        data = r.json()
+        results = data.get("results", []) or []
+        for row in results:
+            out.append({
+                "ticker": row.get("ticker"),
+                "name": row.get("name"),
+                "primary_exchange": row.get("primary_exchange"),
+                "market_cap": row.get("market_cap"),
+            })
+        # polygon sometimes returns "next_url"/"next"/"next_cursor"
+        next_cursor = data.get("next_url") or data.get("next") or data.get("next_cursor")
+        if not next_cursor:
+            break
+        time.sleep(0.3)
+
+    df = pd.DataFrame(out).drop_duplicates(subset=["ticker"]).reset_index(drop=True)
+    if not include_otc:
+        df = df[~df["primary_exchange"].fillna("").str.upper().str.contains("OTC")]
+    return df
+
+# ---------- ATH metrics (Yahoo Finance) ----------
+
+import yfinance as yf
+
+@st.cache_data(show_spinner=False, ttl=60*60*6)  # cache 6h
+def get_ath_metrics(symbols: List[str]) -> pd.DataFrame:
+    """
+    Download max history for symbols (batched) and compute:
+      - last close
+      - ATH close
+      - drawdown % from ATH
+      - ATH date
+      - Since ATH (days)
+    Returns DataFrame index=ticker with columns:
+      [last, ath, dd_pct, ath_date, since_ath_days]
+    """
+    if not symbols:
+        return pd.DataFrame(columns=["last", "ath", "dd_pct", "ath_date", "since_ath_days"])
+
+    rows = []
+    batch_size = 40
+    for i in range(0, len(symbols), batch_size):
+        chunk = symbols[i:i+batch_size]
+        try:
+            df = yf.download(
+                tickers=chunk,
+                period="max",
+                interval="1d",
+                auto_adjust=False,
+                progress=False,
+                group_by="ticker",
+                threads=True,
+            )
+        except Exception:
+            continue
+
+        # Single symbol shape vs multi-index columns
+        if len(chunk) == 1:
+            sym = chunk[0]
+            sub = df.copy()
+            if "Close" not in sub.columns:
+                continue
+            close = sub["Close"].dropna()
+            if close.empty:
+                continue
+            last = float(close.iloc[-1])
+            ath = float(close.max())
+            ath_idx = close.idxmax()
+            # days since ATH uses last available close date (also handles weekends/holidays)
+            last_idx = close.index[-1]
+            since_days = int((pd.Timestamp(last_idx).tz_localize(None) -
+                              pd.Timestamp(ath_idx).tz_localize(None)).days)
+            dd_pct = (ath - last) / ath * 100.0 if ath > 0 else np.nan
+            rows.append((sym, last, ath, dd_pct, pd.to_datetime(ath_idx).date(), since_days))
+        else:
+            for sym in chunk:
+                try:
+                    sub = df[sym].copy()
+                    close = sub["Close"].dropna()
+                    if close.empty:
+                        continue
+                    last = float(close.iloc[-1])
+                    ath = float(close.max())
+                    ath_idx = close.idxmax()
+                    last_idx = close.index[-1]
+                    since_days = int((pd.Timestamp(last_idx).tz_localize(None) -
+                                      pd.Timestamp(ath_idx).tz_localize(None)).days)
+                    dd_pct = (ath - last) / ath * 100.0 if ath > 0 else np.nan
+                    rows.append((sym, last, ath, dd_pct, pd.to_datetime(ath_idx).date(), since_days))
+                except Exception:
+                    continue
+
+    out = pd.DataFrame(
+        rows,
+        columns=["ticker", "last", "ath", "dd_pct", "ath_date", "since_ath_days"]
+    ).set_index("ticker")
+    return out
+
+# ---------- UI ----------
+
+st.set_page_config(page_title="ATH Drawdown Screener", page_icon="📉", layout="wide")
+st.title("📉 ATH Drawdown Screener")
+st.caption("Universe & Market Caps from Polygon • ATH math from Yahoo Finance history")
+
+with st.sidebar:
+    st.subheader("Filters")
+
+    include_otc = st.toggle("Include OTC", value=False)
+
+    # Market cap range (USD, billions for UX)
+    st.caption("Market Cap (USD)")
+    min_cap_b = st.number_input("Min (Billions)", min_value=0.0, value=0.0, step=0.5, format="%.2f")
+    max_cap_b = st.number_input("Max (Billions, 0 = no max)", min_value=0.0, value=0.0, step=0.5, format="%.2f")
+
+    # Drawdown threshold
+    dd_min = st.slider("≥ % below ATH", min_value=0, max_value=95, value=50, step=5)
+
+    # NEW: since ATH days filter
+    max_since_days = st.number_input(
+        "Max days since ATH (0 = no limit)",
+        min_value=0, value=1825, step=30, help="Limit to names whose ATH occurred within N days."
+    )
+
+    # limit/scaling
+    max_symbols = st.slider("Max symbols to scan", 50, 2500, 600, step=50)
+    pages = st.slider("Polygon pages to fetch", 1, 10, 3)
+
+    run_btn = st.button("Run Screener", type="primary")
+
 if not API_KEY:
     st.error("Missing POLYGON_API_KEY. Set env var or Streamlit secret.")
     st.stop()
 
-def poly_get(path: str, params: Dict=None, retries=3, backoff=0.9):
-    """GET with light retry/backoff + 429 handling."""
-    params = dict(params or {})
-    params["apiKey"] = API_KEY
-    url = f"{BASE}{path}"
-    last_err = None
-    for i in range(retries):
-        try:
-            r = requests.get(url, params=params, timeout=30)
-            if r.status_code == 429:
-                time.sleep(backoff * (i+1))
-                continue
-            r.raise_for_status()
-            return r.json()
-        except requests.RequestException as e:
-            last_err = e
-            time.sleep(backoff * (i+1))
-    raise last_err if last_err else RuntimeError("Polygon GET failed")
+# ---------- Run ----------
 
-def today_et() -> dt.date:
-    return dt.datetime.now(ET).date()
+if run_btn:
+    with st.spinner("Fetching universe & market caps from Polygon…"):
+        uni = fetch_polygon_universe(include_otc=include_otc, pages=pages)
+        if uni.empty:
+            st.warning("No tickers from Polygon (check filters).")
+            st.stop()
 
-def prev_business_day(d: dt.date) -> dt.date:
-    wd = d.weekday()
-    if wd == 0: return d - dt.timedelta(days=3)  # Mon -> Fri
-    if wd == 6: return d - dt.timedelta(days=2)  # Sun -> Fri
-    if wd == 5: return d - dt.timedelta(days=1)  # Sat -> Fri
-    return d - dt.timedelta(days=1)
+        # Apply market cap range early
+        min_cap = min_cap_b * 1e9
+        max_cap = max_cap_b * 1e9 if max_cap_b > 0 else None
+        if min_cap > 0:
+            uni = uni[uni["market_cap"].fillna(0) >= min_cap]
+        if max_cap:
+            uni = uni[uni["market_cap"].fillna(0) <= max_cap]
 
-def finviz(sym: str) -> str:
-    return f"https://finviz.com/quote.ashx?t={sym.upper()}"
+        # Top N by cap to control workload
+        uni = uni.sort_values("market_cap", ascending=False).head(max_symbols).reset_index(drop=True)
+        tickers = uni["ticker"].tolist()
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Universe from grouped bars (one API call for the market)
-# ─────────────────────────────────────────────────────────────────────────────
-@st.cache_data(show_spinner=False, ttl=600)
-def get_grouped_bars(date_str: str, locale="us", market="stocks"):
-    """Return grouped daily bars (dict list). Falls back to prev biz day if empty."""
-    j = poly_get(f"/v2/aggs/grouped/locale/{locale}/market/{market}/{date_str}")
-    results = j.get("results", []) or []
-    if not results:
-        # fallback once to the previous business day
-        d = dt.datetime.strptime(date_str, "%Y-%m-%d").date()
-        d2 = prev_business_day(d)
-        j2 = poly_get(f"/v2/aggs/grouped/locale/{locale}/market/{market}/{d2.strftime('%Y-%m-%d')}")
-        results = j2.get("results", []) or []
-        return results, d2.strftime("%Y-%m-%d")
-    return results, date_str
-
-def clean_symbol(sym: str) -> bool:
-    """Filter out obvious test/warrants/units if you want (very light filter)."""
-    # Exclude extremely odd tickers commonly not common shares
-    bad_chars = ["/", "^", " "]
-    if any(ch in sym for ch in bad_chars): return False
-    if sym.endswith(("W", "WS", "U", "RT")):  # warrants/units/rights
-        return False
-    return True
-
-# ─────────────────────────────────────────────────────────────────────────────
-# ATH & current price
-# ─────────────────────────────────────────────────────────────────────────────
-@st.cache_data(show_spinner=False, ttl=24*3600)
-def get_symbol_ath(symbol: str, start="1990-01-01") -> dict:
-    """Fetch daily history and compute ATH (max high) & date."""
-    end = today_et().strftime("%Y-%m-%d")
-    j = poly_get(f"/v2/aggs/ticker/{symbol}/range/1/day/{start}/{end}",
-                 params={"adjusted":"true","sort":"asc","limit":50000})
-    res = j.get("results", [])
-    if not res:
-        return {"ath": None, "ath_date": None}
-    df = pd.DataFrame(res)
-    if "h" not in df or df.empty:
-        return {"ath": None, "ath_date": None}
-    idx = int(df["h"].idxmax())
-    ath = float(df.loc[idx, "h"])
-    ts = pd.to_datetime(df.loc[idx, "t"], unit="ms", utc=True).tz_convert(ET).date()
-    return {"ath": ath, "ath_date": ts}
-
-@st.cache_data(show_spinner=False, ttl=20)
-def get_snapshot_prices(symbols: List[str]) -> dict:
-    """Batch snapshot for last trade prices. Returns dict {symbol: price}."""
-    out = {}
-    BATCH = 50
-    for i in range(0, len(symbols), BATCH):
-        batch = symbols[i:i+BATCH]
-        try:
-            j = poly_get("/v2/snapshot/locale/us/markets/stocks/tickers",
-                         params={"tickers": ",".join(batch)})
-            for t in j.get("tickers", []):
-                sym = t.get("ticker")
-                p = None
-                if t.get("lastTrade") and t["lastTrade"].get("p"):
-                    p = float(t["lastTrade"]["p"])
-                elif t.get("day") and t["day"].get("c"):
-                    p = float(t["day"]["c"])
-                if sym and p:
-                    out[sym] = p
-        except Exception:
-            # continue gracefully
-            pass
-    return out
-
-# ─────────────────────────────────────────────────────────────────────────────
-# UI
-# ─────────────────────────────────────────────────────────────────────────────
-st.set_page_config(page_title="ATH Distance Screener", page_icon="📉", layout="wide")
-st.title("📉 Distance from All-Time High (ATH) — Screener")
-
-with st.sidebar:
-    st.subheader("Universe")
-    default_date = today_et().strftime("%Y-%m-%d")
-    date_str = st.text_input("Universe from grouped bars date (YYYY-MM-DD)", value=default_date)
-    min_price = st.number_input("Min Price ($)", value=5.0, step=0.5)
-    top_by_volume = st.slider("Universe size (Top by Volume from that day)", 50, 1000, 300, step=50)
-    include_watch = st.text_area("Extra symbols (comma-separated)", "AAPL,NVDA,TSLA,AMD,MSFT,AMZN")
-
-    st.subheader("Price Source")
-    use_live = st.checkbox("Use live snapshot price (more API calls)", value=False)
-
-    st.subheader("Filter")
-    # Interpret as “at least X% below ATH”
-    thr = st.slider("Minimum % below ATH", min_value=10, max_value=95, value=50, step=5)
-
-    st.subheader("Options")
-    add_finviz = st.checkbox("Add Finviz links", value=True)
-    auto = st.checkbox("Auto refresh (20s)", value=False)
-
-if auto:
-    st.experimental_rerun()
-
-# Load grouped bars
-with st.status("Building universe from grouped bars…", expanded=False):
-    try:
-        grp, used_date = get_grouped_bars(date_str)
-    except Exception as e:
-        st.error(f"Failed to load grouped bars: {e}")
+    if not tickers:
+        st.warning("No tickers after applying market cap / OTC filters.")
         st.stop()
 
-    if not grp:
-        st.warning("No grouped bars found for the date. Try previous business day.")
+    with st.spinner(f"Computing ATH metrics for {len(tickers)} symbols…"):
+        ath_df = get_ath_metrics(tickers)
+
+    if ath_df.empty:
+        st.warning("No price history available for selected symbols.")
         st.stop()
 
-    # Build universe DF
-    gdf = pd.DataFrame(grp)
-    # Keep common shares-ish
-    gdf = gdf[gdf["T"].apply(clean_symbol)]
-    # Filter by price
-    gdf = gdf[gdf["c"] >= float(min_price)]
-    # Sort by volume, pick top N
-    gdf = gdf.sort_values("v", ascending=False).head(int(top_by_volume))
-    symbols = gdf["T"].tolist()
+    merged = (
+        ath_df.reset_index()
+              .merge(uni[["ticker", "name", "market_cap"]], on="ticker", how="left")
+    )
 
-    if include_watch.strip():
-        extra = [s.strip().upper() for s in include_watch.split(",") if s.strip()]
-        symbols = sorted(set(symbols + extra))
+    # Filter by drawdown threshold
+    merged = merged[merged["dd_pct"] >= dd_min]
 
-st.caption(f"Universe date used: **{used_date}** • Universe size: **{len(symbols)}**")
+    # NEW: filter by since ATH days if user set a limit
+    if max_since_days > 0:
+        merged = merged[merged["since_ath_days"] <= int(max_since_days)]
 
-# Get prices
-price_map = {}
-if use_live:
-    with st.status("Fetching snapshot prices…", expanded=False):
-        price_map = get_snapshot_prices(symbols)
-        # Fallback: if not found in snapshot, use that grouped close (if symbol present)
-        for _, r in gdf.iterrows():
-            sym = r["T"]
-            if sym not in price_map:
-                price_map[sym] = float(r["c"])
+    # Sort by biggest drawdown (farthest below ATH)
+    merged = merged.sort_values("dd_pct", ascending=False)
+
+    if merged.empty:
+        st.info("No matches for the chosen filters (drawdown/market-cap/since-ATH).")
+        st.stop()
+
+    # Present
+    show = merged.copy()
+    show.rename(columns={
+        "ticker": "Symbol",
+        "name": "Company",
+        "last": "Last",
+        "ath": "ATH",
+        "dd_pct": "Below ATH (%)",
+        "market_cap": "Market Cap",
+        "ath_date": "ATH Date",
+        "since_ath_days": "Since ATH (days)",
+    }, inplace=True)
+
+    show["Last"] = show["Last"].map(fmt_price)
+    show["ATH"] = show["ATH"].map(fmt_price)
+    show["Market Cap"] = show["Market Cap"].map(fmt_cap)
+    show["Below ATH (%)"] = show["Below ATH (%)"].map(lambda x: f"{x:,.1f}")
+    # ATH Date already date; ensure string for display
+    show["ATH Date"] = pd.to_datetime(show["ATH Date"]).dt.strftime("%Y-%m-%d")
+
+    st.subheader(f"Results — {len(show):,} matches")
+    st.dataframe(
+        show[["Symbol", "Company", "Market Cap", "Last", "ATH", "Below ATH (%)", "ATH Date", "Since ATH (days)"]],
+        use_container_width=True,
+        height=600
+    )
+
+    # CSV
+    csv = merged.to_csv(index=False)
+    st.download_button(
+        "Download CSV",
+        csv,
+        file_name=f"ath_drawdown_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%MUTC')}.csv",
+        mime="text/csv"
+    )
 else:
-    # Use grouped closes for all in universe
-    price_map = {r["T"]: float(r["c"]) for _, r in gdf.iterrows()}
-
-# Compute ATHs (cached per-symbol)
-rows = []
-skipped = 0
-with st.status("Computing ATH & drawdowns…", expanded=False):
-    for sym in symbols:
-        try:
-            ath_info = get_symbol_ath(sym)
-            ath = ath_info["ath"]
-            ath_date = ath_info["ath_date"]
-            last = price_map.get(sym)
-            if not ath or not last or ath <= 0 or last <= 0:
-                continue
-            dd = 100.0 * (ath - last) / ath  # % below ATH
-            if dd >= thr:
-                rows.append({
-                    "Symbol": sym,
-                    "Last": last,
-                    "ATH": ath,
-                    "% Below ATH": dd,
-                    "ATH Date": ath_date,
-                    "Since ATH (days)": (today_et() - ath_date).days if ath_date else None,
-                    "Finviz": finviz(sym) if add_finviz else "",
-                })
-        except Exception:
-            skipped += 1
-            continue
-
-if not rows:
-    st.info("No symbols matched your drawdown threshold. Try lowering the threshold, increasing the universe size, or enabling live prices.")
-    st.stop()
-
-df = pd.DataFrame(rows)
-df = df.sort_values("% Below ATH", ascending=False).reset_index(drop=True)
-
-# Format nicely
-df_fmt = df.copy()
-df_fmt["Last"] = df_fmt["Last"].map(lambda x: f"{x:,.2f}")
-df_fmt["ATH"]  = df_fmt["ATH"].map(lambda x: f"{x:,.2f}")
-df_fmt["% Below ATH"] = df_fmt["% Below ATH"].map(lambda x: f"{x:,.2f}%")
-if add_finviz:
-    df_fmt["Finviz"] = df_fmt["Finviz"].map(lambda u: f'<a href="{u}" target="_blank">Open</a>')
-
-st.subheader(f"Stocks ≥ {thr}% below their All-Time High")
-st.write(
-    df_fmt[["Symbol","Last","ATH","% Below ATH","ATH Date","Since ATH (days)"] + (["Finviz"] if add_finviz else [])]
-      .to_html(escape=False, index=False),
-    unsafe_allow_html=True
-)
-
-# CSV download
-csv = df.to_csv(index=False).encode("utf-8")
-st.download_button("Download CSV", data=csv, file_name=f"ath_drawdown_{thr}pct_{used_date}.csv", mime="text/csv")
-
-if skipped:
-    st.caption(f"Skipped {skipped} symbol(s) due to missing/invalid data.")
-st.caption("Tip: Enable snapshot prices for ‘as-of-now’ moves (uses more API calls).")
+    st.info("Set your filters (drawdown, market cap, **Max days since ATH**) and click **Run Screener**.")
