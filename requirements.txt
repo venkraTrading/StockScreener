@@ -1,0 +1,7 @@
+streamlit>=1.37
+pandas>=2.2
+numpy>=2.0
+requests>=2.32
+python-dateutil>=2.9
+pytz>=2024.1
+tenacity>=8.4
