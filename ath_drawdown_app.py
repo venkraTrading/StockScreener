@@ -30,41 +30,42 @@ def nice_error_from_response(resp: requests.Response) -> str:
 @st.cache_data(show_spinner=False, ttl=300)
 def fetch_polygon_universe(include_otc: bool, pages: int = 2):
     """
-    Fetch a list of active US stock tickers from Polygon.
-    We use v3/reference/tickers with cursor pagination.
-    We do NOT use 'sort=market_cap' to avoid API errors on some accounts.
-    Returns a DataFrame with columns: ticker, name, market_cap, primary_exchange, locale
+    Fetch a list of active US stock tickers from Polygon using v3/reference/tickers,
+    following pagination via next_url (which already contains the cursor).
     """
     if not POLY_KEY:
         raise RuntimeError("Missing POLYGON_API_KEY. Set env var or Streamlit secret.")
 
-    url = "https://api.polygon.io/v3/reference/tickers"
+    base_url = "https://api.polygon.io/v3/reference/tickers"
     params = {
         "market": "stocks",
         "active": "true",
-        "limit": 1000,           # max allowed by Polygon
-        "order": "desc",         # we'll sort in pandas later if we want
+        "limit": 1000,      # max per page for most plans
+        "order": "desc",
+        # You can optionally restrict to common stock:
+        # "type": "CS",
     }
 
     out = []
-    cursor = None
     fetched_pages = 0
+    next_url = None
 
     while fetched_pages < pages:
-        q = params.copy()
-        if cursor:
-            q["cursor"] = cursor
-        q["apiKey"] = POLY_KEY
+        if next_url:
+            # next_url already contains the cursor & query string; just add apiKey
+            resp = requests.get(next_url, params={"apiKey": POLY_KEY}, timeout=30)
+        else:
+            # first page
+            q = params.copy()
+            q["apiKey"] = POLY_KEY
+            resp = requests.get(base_url, params=q, timeout=30)
 
-        resp = requests.get(url, params=q, timeout=30)
         if not resp.ok:
-            # Surface a friendly API message
             raise requests.HTTPError(nice_error_from_response(resp), response=resp)
 
         data = resp.json()
         results = data.get("results", []) or []
         for r in results:
-            # common fields in v3/reference/tickers
             out.append({
                 "ticker": r.get("ticker"),
                 "name": r.get("name"),
@@ -73,28 +74,28 @@ def fetch_polygon_universe(include_otc: bool, pages: int = 2):
                 "locale": r.get("locale"),
             })
 
-        cursor = data.get("next_url") or data.get("next_url")  # prefer next_url
-        if not cursor:
+        next_url = data.get("next_url")  # may be None on the last page
+        fetched_pages += 1
+        if not next_url:
             break
 
-        fetched_pages += 1
-        # Be gentle with Polygon
-        time.sleep(0.15)
+        time.sleep(0.15)  # be kind to the API
 
     df = pd.DataFrame(out)
-    # drop non-US if present
+
+    # Keep US only
     if not df.empty and "locale" in df.columns:
         df = df[df["locale"].fillna("").str.upper().eq("US")]
 
+    # Exclude OTC if the toggle is off
     if not include_otc and "primary_exchange" in df.columns:
-        # Filter out anything that looks OTC
         df = df[~df["primary_exchange"].fillna("").str.upper().str.contains("OTC")]
 
-    # Some rows may not have market_cap; standardize type
     if "market_cap" in df.columns:
         df["market_cap"] = pd.to_numeric(df["market_cap"], errors="coerce")
 
     return df.reset_index(drop=True)
+
 
 @st.cache_data(show_spinner=False, ttl=3600)
 def fetch_history_yf(ticker: str, lookback_years: int = 15):
