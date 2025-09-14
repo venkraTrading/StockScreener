@@ -6,3 +6,5 @@ python-dateutil>=2.9
 pytz>=2024.1
 tenacity>=8.4
 yfinance>=0.2.41
+# optional but recommended for perfect holiday handling:
+pandas_market_calendars
